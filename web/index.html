@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 영상 자동화</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Segoe UI', 'Apple SD Gothic Neo', sans-serif;
+    background: #0f0f0f; color: #eee;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    padding: 40px 20px;
+  }
+  h1 { font-size: 2rem; margin-bottom: 8px; color: #fff; }
+  .subtitle { color: #888; margin-bottom: 40px; font-size: 0.95rem; }
+
+  .card {
+    background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 16px;
+    padding: 32px; width: 100%; max-width: 600px; margin-bottom: 24px;
+  }
+
+  label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 8px; }
+  input[type=text], input[type=number] {
+    width: 100%; padding: 12px 16px; border-radius: 10px;
+    border: 1px solid #333; background: #111; color: #fff;
+    font-size: 1rem; margin-bottom: 16px;
+    outline: none; transition: border-color 0.2s;
+  }
+  input:focus { border-color: #5865f2; }
+
+  .row { display: flex; gap: 16px; }
+  .row > div { flex: 1; }
+
+  button {
+    width: 100%; padding: 14px; border-radius: 10px; border: none;
+    background: #5865f2; color: #fff; font-size: 1rem; font-weight: 600;
+    cursor: pointer; transition: background 0.2s;
+  }
+  button:hover:not(:disabled) { background: #4752c4; }
+  button:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+  .progress-wrap { display: none; margin-top: 24px; }
+  .progress-label { font-size: 0.85rem; color: #aaa; margin-bottom: 8px; display: flex; justify-content: space-between; }
+  .progress-bar { background: #2a2a2a; border-radius: 99px; height: 8px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 99px; background: #5865f2; transition: width 0.5s; width: 0%; }
+  .status-msg { margin-top: 10px; font-size: 0.9rem; color: #bbb; min-height: 20px; }
+
+  .done-card {
+    display: none; background: #0d2117; border: 1px solid #1a4a2a;
+    border-radius: 16px; padding: 28px; width: 100%; max-width: 600px;
+    text-align: center;
+  }
+  .done-card h2 { color: #4ade80; margin-bottom: 8px; }
+  .done-card p { color: #aaa; margin-bottom: 20px; font-size: 0.9rem; }
+  .download-btn {
+    display: inline-block; padding: 12px 32px; background: #16a34a;
+    color: #fff; border-radius: 10px; text-decoration: none;
+    font-weight: 600; font-size: 1rem; transition: background 0.2s;
+  }
+  .download-btn:hover { background: #15803d; }
+
+  .history { width: 100%; max-width: 600px; }
+  .history h3 { color: #666; font-size: 0.85rem; margin-bottom: 12px; }
+  .job-item {
+    background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+    padding: 14px 18px; margin-bottom: 8px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .job-topic { font-size: 0.9rem; }
+  .badge {
+    padding: 3px 10px; border-radius: 99px; font-size: 0.75rem; font-weight: 600;
+  }
+  .badge.done { background: #14532d; color: #4ade80; }
+  .badge.running { background: #1e3a5f; color: #60a5fa; }
+  .badge.error { background: #450a0a; color: #f87171; }
+  .badge.pending { background: #2a2a2a; color: #888; }
+  .job-dl { color: #5865f2; font-size: 0.8rem; text-decoration: none; margin-left: 12px; }
+  .job-dl:hover { text-decoration: underline; }
+  .error-msg { color: #f87171; font-size: 0.85rem; margin-top: 12px; display: none; }
+</style>
+</head>
+<body>
+
+<h1>🎬 AI 영상 자동화</h1>
+<p class="subtitle">주제를 입력하면 영상을 자동으로 만들어 드립니다</p>
+
+<div class="card">
+  <label>영상 주제</label>
+  <input type="text" id="topic" placeholder="예: 경복궁의 역사, 2026년 AI 트렌드..." />
+
+  <div class="row">
+    <div>
+      <label>목표 시간 (초)</label>
+      <input type="number" id="duration" value="180" min="30" max="600" />
+    </div>
+  </div>
+
+  <button id="startBtn" onclick="startGenerate()">영상 생성 시작</button>
+  <div class="error-msg" id="errorMsg"></div>
+
+  <div class="progress-wrap" id="progressWrap">
+    <div class="progress-label">
+      <span>진행률</span><span id="progressPct">0%</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="status-msg" id="statusMsg">처리 중...</div>
+  </div>
+</div>
+
+<div class="done-card" id="doneCard">
+  <h2>✅ 완료!</h2>
+  <p id="doneTitle"></p>
+  <a id="downloadLink" class="download-btn" href="#">⬇️ 영상 다운로드</a>
+</div>
+
+<div class="history">
+  <h3>최근 작업 내역</h3>
+  <div id="historyList"></div>
+</div>
+
+<script>
+let currentJobId = null;
+let pollTimer = null;
+
+async function startGenerate() {
+  const topic = document.getElementById('topic').value.trim();
+  const duration = parseInt(document.getElementById('duration').value) || 180;
+  const errEl = document.getElementById('errorMsg');
+
+  if (!topic) { showError('주제를 입력해주세요.'); return; }
+
+  hideError();
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('progressWrap').style.display = 'block';
+  document.getElementById('doneCard').style.display = 'none';
+  updateProgress(0, '요청 전송 중...');
+
+  try {
+    const res = await fetch('/api/generate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({topic, duration}),
+    });
+    if (!res.ok) {
+      const ct = res.headers.get('content-type') || '';
+      const msg = ct.includes('json')
+        ? (await res.json()).detail
+        : `서버 오류 (HTTP ${res.status})`;
+      throw new Error(msg || '서버 오류');
+    }
+    const data = await res.json();
+    currentJobId = data.job_id;
+    pollStatus();
+  } catch (e) {
+    showError('요청 실패: ' + e.message);
+    document.getElementById('startBtn').disabled = false;
+  }
+}
+
+function pollStatus() {
+  if (!currentJobId) return;
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/status/${currentJobId}`);
+      const job = await res.json();
+      updateProgress(job.progress, job.message);
+      if (job.status === 'done') {
+        showDone(job);
+        loadHistory();
+      } else if (job.status === 'error') {
+        showError(job.message);
+        document.getElementById('startBtn').disabled = false;
+      } else {
+        pollStatus();
+      }
+    } catch { pollStatus(); }
+  }, 2000);
+}
+
+function updateProgress(pct, msg) {
+  document.getElementById('progressFill').style.width = pct + '%';
+  document.getElementById('progressPct').textContent = pct + '%';
+  document.getElementById('statusMsg').textContent = msg;
+}
+
+function showDone(job) {
+  document.getElementById('doneCard').style.display = 'block';
+  document.getElementById('doneTitle').textContent = job.topic;
+  document.getElementById('downloadLink').href = `/api/download/${currentJobId}`;
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('topic').value = '';
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorMsg');
+  el.textContent = msg; el.style.display = 'block';
+}
+function hideError() {
+  document.getElementById('errorMsg').style.display = 'none';
+}
+
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/jobs');
+    const jobs = await res.json();
+    const el = document.getElementById('historyList');
+    el.innerHTML = jobs.slice(0, 10).map(j => `
+      <div class="job-item">
+        <span class="job-topic">${j.topic}</span>
+        <span>
+          <span class="badge ${j.status}">${statusLabel(j.status)}</span>
+          ${j.status === 'done' ? `<a class="job-dl" href="/api/download/${j.job_id}">다운로드</a>` : ''}
+        </span>
+      </div>
+    `).join('');
+  } catch {}
+}
+
+function statusLabel(s) {
+  return {pending:'대기',running:'생성중',done:'완료',error:'오류'}[s] || s;
+}
+
+loadHistory();
+setInterval(loadHistory, 10000);
+
+document.getElementById('topic').addEventListener('keydown', e => {
+  if (e.key === 'Enter') startGenerate();
+});
+</script>
+</body>
+</html>
