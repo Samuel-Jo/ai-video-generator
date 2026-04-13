@@ -1,12 +1,10 @@
 """
-Phase 2: Pexels API로 스톡 영상 수집 (Unsplash 이미지 폴백)
-각 scene의 visual_description 키워드로 검색 → assets/ 저장
+Phase 2: 스톡 영상 수집 — Pexels → Pixabay → 서식지 폴백 3단계
 
-핵심 품질 보증:
-1. 복합 동물명 추출 (snow leopard / polar bear / arctic hare 등)
-2. URL slug + 태그 기반 1차 필터
-3. Gemini Vision 썸네일 검증으로 "늑대 검색 → 개 영상" 차단
-4. page 1 고정 + 랜덤 보조 페이지로 풍부한 후보 확보
+검색 순서:
+  1) Pexels   (page 1 + 랜덤 보조 페이지, slug/Gemini 필터)
+  2) Pixabay  (야생동물 전문, PIXABAY_API_KEY 있을 때)
+  3) 서식지 폴백  (동물 못 찾으면 해당 동물의 서식지 영상 — 사람 등장 방지)
 """
 
 import re
@@ -22,114 +20,153 @@ import requests
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     PEXELS_API_KEY, UNSPLASH_API_KEY, ASSETS_DIR,
-    VIDEO_WIDTH, VIDEO_HEIGHT, GEMINI_API_KEY,
+    GEMINI_API_KEY, PIXABAY_API_KEY,
 )
 
-PEXELS_VIDEO_URL = "https://api.pexels.com/videos/search"
-PEXELS_PHOTO_URL = "https://api.pexels.com/v1/search"
-UNSPLASH_URL    = "https://api.unsplash.com/search/photos"
+PEXELS_VIDEO_URL  = "https://api.pexels.com/videos/search"
+PEXELS_PHOTO_URL  = "https://api.pexels.com/v1/search"
+PIXABAY_VIDEO_URL = "https://pixabay.com/api/videos/"
+UNSPLASH_URL      = "https://api.unsplash.com/search/photos"
 
 # ──────────────────────────────────────────────────────────────────
-# 복합 동물 이름 목록
-# 첫 단어만으로 동물을 특정할 수 없는 경우 (긴 것부터 매칭)
+# 복합 동물 이름 (첫 단어만으로 동물을 특정할 수 없는 경우)
 # ──────────────────────────────────────────────────────────────────
 _COMPOUND_ANIMALS = sorted([
     "snow leopard", "polar bear", "arctic hare", "arctic fox",
     "snowy owl", "snowy egret", "grizzly bear", "gray wolf",
     "bald eagle", "great horned owl", "barn owl", "golden eagle",
-    "killer whale", "blue whale", "humpback whale", "sperm whale",
+    "killer whale", "blue whale", "humpback whale",
     "sea otter", "sea lion", "mountain lion", "mountain goat",
     "white wolf", "black bear", "red fox", "red deer",
     "brown bear", "black wolf", "spotted hyena",
-], key=len, reverse=True)  # 긴 것부터 매칭해야 "snow leopard" > "snow" 우선
+    "wild boar", "wild cat",
+], key=len, reverse=True)
 
-# 풍경/배경 키워드 → 동물 없는 장면, Gemini 검증 불필요
+# 풍경/배경 전용 장면 (Gemini 검증·동물 필터 불필요)
 _SCENE_WORDS = {
     "snow", "snowy", "winter", "landscape", "forest", "mountain",
     "sunset", "sunrise", "various", "beautiful", "nature", "scenic",
     "sky", "clouds", "ocean", "sea", "river", "lake", "field",
-    "aerial", "timelapse", "city", "urban", "mountain",
+    "aerial", "timelapse", "city", "urban",
+}
+
+# 행동/수식 단어 (서식지 추출 시 제거)
+_ACTION_WORDS = frozenset({
+    "running", "walking", "hopping", "flying", "swimming", "hunting",
+    "camouflage", "pack", "herd", "hiding", "jumping", "crawling",
+    "stalking", "prowling", "sleeping", "eating", "playing",
+    "various", "beautiful", "group", "alone",
+})
+
+# 동물별 기본 서식지 키워드 (최후 수단 폴백용)
+_ANIMAL_HABITATS = {
+    "wolf":         "winter forest snow wilderness",
+    "fox":          "forest snow meadow",
+    "polar bear":   "arctic ice snow ocean",
+    "snow leopard": "rocky mountain snow high altitude",
+    "reindeer":     "snowy tundra forest",
+    "arctic hare":  "snowy tundra white landscape",
+    "snowy owl":    "snowy field winter open sky",
+    "weasel":       "forest floor snow leaves",
+    "stoat":        "forest snow nature",
+    "ermine":       "snowy ground nature",
+    "arctic fox":   "arctic tundra snow ice",
+    "lynx":         "pine forest snow winter",
+    "wolverine":    "taiga forest snow",
+    "musk ox":      "arctic tundra snow herd",
+    "moose":        "forest lake snow winter",
+    "elk":          "forest meadow snow",
 }
 
 # Gemini 클라이언트 (lazy init)
 _gemini_client = None
 
 
-# ──────────────────────────────────────────────────────────────────
-# 헬퍼 함수
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# 내부 헬퍼
+# ══════════════════════════════════════════════════════════════════
 
 def _get_gemini():
-    """Gemini 클라이언트 싱글턴."""
     global _gemini_client
     if _gemini_client is None and GEMINI_API_KEY:
-        from google import genai as _genai
-        _gemini_client = _genai.Client(api_key=GEMINI_API_KEY)
+        from google import genai as _g
+        _gemini_client = _g.Client(api_key=GEMINI_API_KEY)
     return _gemini_client
 
 
 def _extract_subject(keyword: str) -> str:
-    """
-    키워드에서 동물/주인공 이름 추출.
-    복합 동물명(snow leopard, polar bear …) 우선 매칭.
-    """
-    kw_lower = keyword.lower().strip()
+    """복합 동물명 우선 추출 (snow leopard, polar bear …)."""
+    kw = keyword.lower().strip()
     for compound in _COMPOUND_ANIMALS:
-        if kw_lower.startswith(compound):
+        if kw.startswith(compound):
             return compound
-    return kw_lower.split()[0]
+    return kw.split()[0]
+
+
+def _get_habitat_fallback(keyword: str, subject: str) -> str:
+    """
+    동물 이름·행동 단어를 제거한 서식지 키워드 반환.
+    사전 등록 동물은 정확한 서식지 키워드 우선 사용.
+    """
+    # 사전 등록 서식지
+    if subject in _ANIMAL_HABITATS:
+        return _ANIMAL_HABITATS[subject]
+
+    # 자동 추출: 동물 이름 + 행동 단어 제거
+    subject_words = set(subject.lower().split())
+    remaining = [
+        w for w in keyword.lower().split()
+        if w not in subject_words and w not in _ACTION_WORDS
+    ]
+    return (" ".join(remaining[:3]) + " nature landscape").strip() if remaining \
+        else "nature wildlife landscape"
 
 
 def _score_video(video: dict, keyword: str) -> int:
-    """
-    URL slug(3점) + 태그(1점) 합산 관련성 점수.
-    slug 예: /video/wolf-running-in-snow-12345/ → "wolf running in snow"
-    """
+    """URL slug(3점) + 태그(1점). 단어 경계 매칭."""
     words = keyword.lower().split()
     score = 0
-    slug_match = re.search(r'/video/([^/?]+)', video.get("url", ""))
+    # Pexels: /video/wolf-..., Pixabay: /videos/wolf-...
+    slug_match = re.search(r'/videos?/([^/?]+)', video.get("url", ""))
     if slug_match:
-        slug = slug_match.group(1).replace('-', ' ').lower()
+        slug_words = slug_match.group(1).replace('-', ' ').lower().split()
         for w in words:
-            if w in slug.split():  # 단어 경계 매칭
+            if w in slug_words:
                 score += 3
     tags = [t["title"].lower() for t in video.get("tags", [])]
+    tag_words = " ".join(tags).split()
     for w in words:
-        if any(w == tag or w in tag.split() for tag in tags):
+        if w in tag_words:
             score += 1
     return score
 
 
 def _is_subject_present(video: dict, subject: str) -> bool:
     """
-    주인공(subject)이 URL slug 또는 태그에 있어야 통과.
-    복합어(snow leopard)의 경우 ALL 단어가 있어야 함.
-    단어 경계 매칭 사용 (snow ≠ snowy, snowy landscape).
+    주인공 단어가 URL slug·태그에 모두 존재해야 통과.
+    단어 경계 매칭 (snow ≠ snowy).
     """
     subject_words = subject.lower().split()
 
-    slug_match = re.search(r'/video/([^/?]+)', video.get("url", ""))
+    slug_match = re.search(r'/videos?/([^/?]+)', video.get("url", ""))
     if slug_match:
         slug_words = slug_match.group(1).replace('-', ' ').lower().split()
         if all(w in slug_words for w in subject_words):
             return True
 
-    tags_flat = " ".join(t["title"].lower() for t in video.get("tags", []))
-    tag_words  = tags_flat.split()
-    if all(w in tag_words for w in subject_words):
-        return True
-
-    return False
+    tags = [t["title"].lower() for t in video.get("tags", [])]
+    tag_words = " ".join(tags).split()
+    return all(w in tag_words for w in subject_words)
 
 
 def _verify_thumbnail(thumbnail_url: str, subject: str) -> bool:
     """
     Gemini Vision으로 썸네일에 해당 동물이 실제 등장하는지 검증.
-    '늑대 검색 → 개 영상' 같은 미묘한 불일치를 잡아냄.
+    slug/태그로 잡지 못한 미묘한 불일치(늑대→개 등) 차단.
     """
     client = _get_gemini()
     if client is None or not thumbnail_url:
-        return True  # Gemini 없으면 통과
+        return True
     try:
         from google.genai import types
         img_bytes = requests.get(thumbnail_url, timeout=8).content
@@ -151,11 +188,11 @@ def _verify_thumbnail(thumbnail_url: str, subject: str) -> bool:
         return passed
     except Exception as e:
         print(f"  [Gemini Vision] 오류 (통과 처리): {e}")
-        return True  # 오류 시 차단하지 않음
+        return True
 
 
 def _best_hd_file(video: dict) -> dict | None:
-    """video_files 중 width >= 1280 인 가장 해상도 높은 파일 반환."""
+    """width >= 1280 인 파일 중 해상도 최고 반환."""
     files = sorted(
         video.get("video_files", []),
         key=lambda f: (f.get("width", 0), f.get("height", 0)),
@@ -167,21 +204,19 @@ def _best_hd_file(video: dict) -> dict | None:
     return None
 
 
+# ══════════════════════════════════════════════════════════════════
+# 검색 소스별 함수
+# ══════════════════════════════════════════════════════════════════
+
 def _pexels_search(query: str, page: int = 1, per_page: int = 15) -> list:
-    """Pexels 영상 검색 (단일 페이지)."""
     if not PEXELS_API_KEY:
         return []
     try:
         resp = requests.get(
             PEXELS_VIDEO_URL,
             headers={"Authorization": PEXELS_API_KEY},
-            params={
-                "query":       query,
-                "orientation": "landscape",
-                "size":        "large",
-                "per_page":    per_page,
-                "page":        page,
-            },
+            params={"query": query, "orientation": "landscape",
+                    "size": "large", "per_page": per_page, "page": page},
             timeout=15,
         )
         resp.raise_for_status()
@@ -191,69 +226,123 @@ def _pexels_search(query: str, page: int = 1, per_page: int = 15) -> list:
         return []
 
 
-def _select_best(
-    videos: list,
-    query: str,
-    subject: str,
-    used_ids: set,
-    use_gemini: bool,
-) -> dict | None:
+def _pixabay_search(query: str, per_page: int = 15) -> list:
+    """Pixabay 영상 검색 (야생동물 전문 소스)."""
+    if not PIXABAY_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            PIXABAY_VIDEO_URL,
+            params={
+                "key":        PIXABAY_API_KEY,
+                "q":          query,
+                "video_type": "film",
+                "per_page":   per_page,
+                "safesearch": "true",
+                "order":      "relevant",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        hits = resp.json().get("hits", [])
+        return [_pixabay_to_internal(h) for h in hits]
+    except Exception as e:
+        print(f"  [Pixabay] '{query}' 오류: {e}")
+        return []
+
+
+def _pixabay_to_internal(hit: dict) -> dict:
+    """Pixabay 응답을 내부 video dict 형식으로 통일."""
+    tags = [{"title": t.strip()} for t in hit.get("tags", "").split(",") if t.strip()]
+    files = []
+    for size in ("large", "medium", "small"):
+        s = hit.get("videos", {}).get(size, {})
+        if s.get("url") and s.get("width", 0) >= 640:
+            files.append({"link": s["url"], "width": s.get("width", 0),
+                          "height": s.get("height", 0)})
+    return {
+        "id":          f"pixabay_{hit['id']}",
+        "url":         hit.get("pageURL", ""),
+        "image":       hit.get("webformatURL", ""),
+        "tags":        tags,
+        "video_files": files,
+    }
+
+
+def _gather_candidates(query: str, source: str) -> list:
     """
-    후보 영상 중 최적 선택:
-    1) slug/태그 필터 (1차)
-    2) 점수 내림차순 정렬
-    3) Gemini Vision 검증 (use_gemini=True 이고 동물 장면인 경우)
-    slug 필터 통과 결과가 없으면 전체를 대상으로 Gemini 검증 (모든 후보 재검토)
+    검색 소스에 따라 후보 영상 수집.
+    source: "pexels" | "pixabay"
     """
-    is_animal = subject not in _SCENE_WORDS
-    relevant   = [v for v in videos if _is_subject_present(v, subject)]
+    if source == "pixabay":
+        return _pixabay_search(query, per_page=20)
+
+    # Pexels: page 1 항상 + 랜덤 보조 페이지
+    p1   = _pexels_search(query, page=1,               per_page=15)
+    p_ex = _pexels_search(query, page=random.randint(2, 4), per_page=10)
+    seen, merged = set(), []
+    for v in p1 + p_ex:
+        if v["id"] not in seen:
+            seen.add(v["id"])
+            merged.append(v)
+    return merged
+
+
+def _select_best(videos: list, query: str, subject: str,
+                 used_ids: set, use_gemini: bool) -> dict | None:
+    """
+    후보 중 최적 영상 선택:
+      1) slug/태그 필터 → relevant
+      2) relevant 없으면 전체를 Gemini로 검증 (fallback_mode)
+      3) 점수 정렬 → Gemini Vision 최종 검증 → 다운로드
+    """
+    is_animal    = subject not in _SCENE_WORDS
+    relevant     = [v for v in videos if _is_subject_present(v, subject)]
     fallback_mode = len(relevant) == 0
 
     if fallback_mode:
-        # slug 필터가 모두 거른 경우 → Gemini가 전체를 검증
-        print(f"  [선택] slug 필터 결과 0개 → Gemini로 전체 {len(videos)}개 검증")
+        print(f"  [선택] slug 필터 0개 → Gemini로 전체 {len(videos)}개 재검토")
         relevant = videos
 
     scored      = sorted(relevant, key=lambda v: _score_video(v, query), reverse=True)
-    max_gemini  = 5 if fallback_mode else 3
+    max_gemini  = 6 if fallback_mode else 3
     gemini_used = 0
 
     for video in scored:
         if video["id"] in used_ids:
             continue
-
-        # Gemini Vision 검증 (동물 장면, 예산 내)
         if use_gemini and is_animal and gemini_used < max_gemini:
-            thumbnail = video.get("image", "")
-            if thumbnail:
+            thumb = video.get("image", "")
+            if thumb:
                 gemini_used += 1
-                if not _verify_thumbnail(thumbnail, subject):
-                    continue  # Gemini 거부 → 다음 후보
-
+                if not _verify_thumbnail(thumb, subject):
+                    continue
         return video
 
     return None
 
 
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 # 공개 API
-# ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
 
 def collect_assets(scenes: list) -> dict:
     """
-    scenes 리스트를 받아 각 scene에 맞는 영상/이미지를 수집.
-    반환값: {scene_id: Path} 딕셔너리
+    scenes 리스트 → 각 scene에 맞는 영상/이미지 수집.
+    반환: {scene_id: Path}
     """
-    results         = {}
-    used_video_ids: set = set()  # 전체 장면 걸친 중복 방지
+    results        = {}
+    used_video_ids: set = set()
 
     for scene in scenes:
-        sid      = scene["scene_id"]
-        keyword  = scene["visual_description"]
-        fallbacks = scene.get("search_fallbacks", [])
+        sid             = scene["scene_id"]
+        keyword         = scene["visual_description"]
+        fallbacks       = scene.get("search_fallbacks", [])
+        habitat_hint    = scene.get("habitat_fallback", "")   # Layer 3 필드
         print(f"[asset_collector] scene {sid}: '{keyword}' 검색 중...")
 
-        asset_path = _fetch_video(sid, keyword, fallbacks, used_video_ids)
+        asset_path = _fetch_video(sid, keyword, fallbacks, used_video_ids, habitat_hint)
+
         if asset_path is None:
             print(f"  → 영상 없음, Pexels 이미지로 폴백")
             asset_path = _fetch_photo_pexels(sid, keyword)
@@ -272,73 +361,92 @@ def collect_assets(scenes: list) -> dict:
 
 
 def _fetch_video(
-    scene_id:  int,
-    keyword:   str,
-    fallbacks: list = None,
-    used_ids:  set  = None,
+    scene_id:      int,
+    keyword:       str,
+    fallbacks:     list = None,
+    used_ids:      set  = None,
+    habitat_hint:  str  = "",
 ) -> Path | None:
-    if not PEXELS_API_KEY:
+    if not PEXELS_API_KEY and not PIXABAY_API_KEY:
         return None
     if used_ids is None:
         used_ids = set()
 
-    subject    = _extract_subject(keyword)   # 복합 동물명 지원
+    subject    = _extract_subject(keyword)
     queries    = [keyword] + (fallbacks or [])
-    use_gemini = subject not in _SCENE_WORDS  # 풍경 장면은 Gemini 불필요
+    use_gemini = subject not in _SCENE_WORDS
 
+    # ── 1단계: Pexels ────────────────────────────────────────────
     for query in queries:
-        query_subject = _extract_subject(query)
-
-        # ── page 1(최상위 결과) 항상 포함 + 랜덤 보조 페이지로 다양성 확보 ──
-        p1_videos    = _pexels_search(query, page=1,                  per_page=15)
-        extra_page   = random.randint(2, 4)
-        extra_videos = _pexels_search(query, page=extra_page,         per_page=10)
-
-        # 중복 제거 후 합산
-        seen_ids   = set()
-        all_videos = []
-        for v in p1_videos + extra_videos:
-            if v["id"] not in seen_ids:
-                seen_ids.add(v["id"])
-                all_videos.append(v)
-
-        if not all_videos:
-            print(f"  [Pexels] '{query}' 결과 없음, 다음 키워드...")
+        q_subject = _extract_subject(query)
+        candidates = _gather_candidates(query, "pexels")
+        if not candidates:
+            print(f"  [Pexels] '{query}' 결과 없음")
             continue
 
-        print(
-            f"  [Pexels] '{query}' {len(all_videos)}개 후보, "
-            f"주인공: '{query_subject}'"
-        )
-
-        best = _select_best(all_videos, query, query_subject, used_ids, use_gemini)
-        if best is None:
-            print(f"  → '{query}': 유효한 영상 없음, 다음 키워드...")
-            time.sleep(0.3)
-            continue
-
-        vf = _best_hd_file(best)
-        if vf:
-            safe_q = query.replace(' ', '_')[:20]
-            out    = ASSETS_DIR / f"{scene_id}_{safe_q}.mp4"
-            if _download(vf["link"], out):
-                used_ids.add(best["id"])
+        print(f"  [Pexels] '{query}' {len(candidates)}개, 주인공: '{q_subject}'")
+        best = _select_best(candidates, query, q_subject, used_ids, use_gemini)
+        if best:
+            out = _download_video(best, scene_id, query, used_ids)
+            if out:
                 return out
-        time.sleep(0.2)
+        time.sleep(0.3)
 
-    # ── 최후 수단: 필터·검증 완전 해제, primary 키워드 page 1 ──────
-    print(f"  ⚠️ 모든 키워드 실패 → 필터 해제 최후 시도 ('{keyword}')")
-    for v in _pexels_search(keyword, page=1, per_page=5):
-        if v["id"] not in used_ids:
-            vf = _best_hd_file(v)
-            if vf:
-                out = ASSETS_DIR / f"{scene_id}_{keyword.replace(' ', '_')[:20]}.mp4"
-                if _download(vf["link"], out):
-                    used_ids.add(v["id"])
+    # ── 2단계: Pixabay (야생동물 전문 소스) ─────────────────────
+    if PIXABAY_API_KEY:
+        for query in queries:
+            q_subject  = _extract_subject(query)
+            candidates = _gather_candidates(query, "pixabay")
+            if not candidates:
+                continue
+
+            print(f"  [Pixabay] '{query}' {len(candidates)}개, 주인공: '{q_subject}'")
+            best = _select_best(candidates, query, q_subject, used_ids, use_gemini)
+            if best:
+                out = _download_video(best, scene_id, query, used_ids)
+                if out:
                     return out
+            time.sleep(0.3)
+    else:
+        print(f"  [Pixabay] API 키 없음 (pixabay.com/api/ 에서 무료 발급 권장)")
+
+    # ── 3단계: 서식지 폴백 (사람 등장 방지) ─────────────────────
+    habitat_query = (
+        habitat_hint.strip()
+        or _get_habitat_fallback(keyword, subject)
+    )
+    print(f"  ⚠️ 동물 영상 없음 → 서식지 대체: '{habitat_query}'")
+
+    for source in ("pexels", "pixabay"):
+        if source == "pixabay" and not PIXABAY_API_KEY:
+            continue
+        candidates = _gather_candidates(habitat_query, source)
+        for v in candidates:
+            if v["id"] in used_ids:
+                continue
+            out = _download_video(v, scene_id, habitat_query, used_ids)
+            if out:
+                return out
+        time.sleep(0.3)
 
     return None
 
+
+def _download_video(video: dict, scene_id: int, query: str, used_ids: set) -> Path | None:
+    """영상 파일 선택·다운로드·ID 등록."""
+    vf = _best_hd_file(video)
+    if vf:
+        safe_q = query.replace(' ', '_')[:20]
+        out    = ASSETS_DIR / f"{scene_id}_{safe_q}.mp4"
+        if _download(vf["link"], out):
+            used_ids.add(video["id"])
+            return out
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════
+# 이미지 폴백
+# ══════════════════════════════════════════════════════════════════
 
 def _fetch_photo_pexels(scene_id: int, keyword: str) -> Path | None:
     if not PEXELS_API_KEY:
@@ -390,7 +498,7 @@ def _download(url: str, dest: Path) -> bool:
         dest.write_bytes(resp.content)
         return True
     except Exception as e:
-        print(f"  [download] 실패 {url[:60]}...: {e}")
+        print(f"  [download] 실패 {url[:60]}…: {e}")
         return False
 
 
@@ -405,5 +513,4 @@ if __name__ == "__main__":
     results = collect_assets(script["scenes"])
     print("\n=== 수집 결과 ===")
     for sid, path in results.items():
-        status = str(path) if path else "❌ 실패"
-        print(f"  scene {sid}: {status}")
+        print(f"  scene {sid}: {str(path) if path else '❌ 실패'}")

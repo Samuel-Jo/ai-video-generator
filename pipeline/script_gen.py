@@ -32,6 +32,7 @@ SYSTEM_PROMPT = """\
       "duration_sec": 20,
       "visual_description": "영문 Pexels 검색 키워드 (주인공 이름 첫 단어 필수, 예: wolf running snow)",
       "search_fallbacks": ["wolf pack forest", "wolf wildlife"],
+      "habitat_fallback": "winter forest snow wilderness",
       "subtitle": "화면 하단에 표시할 자막 (30자 이내 핵심 문장)"
     }
   ]
@@ -45,6 +46,10 @@ SYSTEM_PROMPT = """\
   예) 전기차 장면 → "electric car highway" (electric car 우선)
 - search_fallbacks: 검색 실패 시 사용할 대체 키워드 2개 (구체적→일반적 순서)
   예) ["wolf pack howling", "wolf animal wilderness"]
+- habitat_fallback: 동물 영상을 끝내 못 찾을 때 대체할 서식지/환경 키워드 (동물 이름 제외)
+  예) 늑대 장면 → "winter forest snow wilderness"
+  예) 설표 장면 → "rocky mountain snow high altitude"
+  예) 북극토끼 → "snowy tundra arctic landscape"
 - 장면은 8~12개 사이로 구성
 - narration은 각 장면당 읽는 데 duration_sec 초가 걸리는 분량
 """
@@ -63,6 +68,7 @@ FEW_SHOT = """\
       "duration_sec": 20,
       "visual_description": "electric car highway future",
       "search_fallbacks": ["electric vehicle charging", "electric car road"],
+      "habitat_fallback": "highway road traffic modern",
       "subtitle": "전기차 점유율 30% 돌파"
     }
   ]

@@ -5,9 +5,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # --- API Keys ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-UNSPLASH_API_KEY = os.getenv("UNSPLASH_API_KEY", "")
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
+PEXELS_API_KEY    = os.getenv("PEXELS_API_KEY", "")
+UNSPLASH_API_KEY  = os.getenv("UNSPLASH_API_KEY", "")
+PIXABAY_API_KEY   = os.getenv("PIXABAY_API_KEY", "")   # 무료: pixabay.com/api/
 
 # --- CapCutAPI 로컬 서버 ---
 CAPCUT_API_BASE = os.getenv("CAPCUT_API_BASE", "http://localhost:9001")
