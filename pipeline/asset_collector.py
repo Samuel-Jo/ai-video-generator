@@ -3,8 +3,10 @@ Phase 2: Pexels API로 스톡 영상 수집 (Unsplash 이미지 폴백)
 각 scene의 visual_description 키워드로 검색 → assets/ 저장
 """
 
+import re
 import sys
 import time
+import random
 import argparse
 import json
 from pathlib import Path
@@ -25,13 +27,14 @@ def collect_assets(scenes: list) -> dict:
     반환값: {scene_id: Path} 딕셔너리
     """
     results = {}
+    used_video_ids: set = set()  # 전체 장면에 걸친 중복 영상 사용 방지
     for scene in scenes:
         sid = scene["scene_id"]
         keyword = scene["visual_description"]
         fallbacks = scene.get("search_fallbacks", [])
         print(f"[asset_collector] scene {sid}: '{keyword}' 검색 중...")
 
-        asset_path = _fetch_video(sid, keyword, fallbacks)
+        asset_path = _fetch_video(sid, keyword, fallbacks, used_video_ids)
         if asset_path is None:
             print(f"  → 영상 없음, Pexels 이미지로 폴백")
             asset_path = _fetch_photo_pexels(sid, keyword)
@@ -49,10 +52,32 @@ def collect_assets(scenes: list) -> dict:
 
 
 def _score_video(video: dict, keyword: str) -> int:
-    """Pexels 태그와 키워드 단어 겹치는 수로 관련성 점수 계산."""
-    tags = [t["title"].lower() for t in video.get("tags", [])]
+    """URL slug(3점) + 태그(1점) 합산 관련성 점수."""
     words = keyword.lower().split()
-    return sum(1 for w in words if any(w in tag for tag in tags))
+    score = 0
+    # URL slug 파싱 - 실제 영상 제목이 담겨 있어 가장 신뢰도 높음
+    # 예: https://www.pexels.com/video/wolf-running-in-snow-12345/
+    slug_match = re.search(r'/video/([^/?]+)', video.get("url", ""))
+    if slug_match:
+        slug = slug_match.group(1).replace('-', ' ').lower()
+        for w in words:
+            if w in slug:
+                score += 3
+    tags = [t["title"].lower() for t in video.get("tags", [])]
+    for w in words:
+        if any(w in tag for tag in tags):
+            score += 1
+    return score
+
+
+def _is_subject_present(video: dict, subject: str) -> bool:
+    """주인공(첫 단어)이 URL slug 또는 태그에 있어야 통과 - 완전 불일치 영상 차단."""
+    slug_match = re.search(r'/video/([^/?]+)', video.get("url", ""))
+    if slug_match:
+        if subject in slug_match.group(1).replace('-', ' ').lower():
+            return True
+    tags = [t["title"].lower() for t in video.get("tags", [])]
+    return any(subject in tag for tag in tags)
 
 
 def _best_hd_file(video: dict) -> dict | None:
@@ -68,19 +93,23 @@ def _best_hd_file(video: dict) -> dict | None:
     return None
 
 
-def _fetch_video(scene_id: int, keyword: str, fallbacks: list = None) -> Path | None:
+def _fetch_video(scene_id: int, keyword: str, fallbacks: list = None, used_ids: set = None) -> Path | None:
     if not PEXELS_API_KEY:
         return None
+    if used_ids is None:
+        used_ids = set()
 
     queries = [keyword] + (fallbacks or [])
     headers = {"Authorization": PEXELS_API_KEY}
 
     for query in queries:
+        subject = query.lower().split()[0]  # 주인공 이름 (첫 단어)
         params = {
             "query": query,
             "orientation": "landscape",
             "size": "large",
             "per_page": 15,
+            "page": random.randint(1, 3),   # 매 실행마다 다른 결과 페이지
         }
         try:
             resp = requests.get(PEXELS_VIDEO_URL, headers=headers, params=params, timeout=15)
@@ -94,18 +123,45 @@ def _fetch_video(scene_id: int, keyword: str, fallbacks: list = None) -> Path | 
             print(f"  [Pexels video] '{query}' 결과 없음, 다음 키워드 시도...")
             continue
 
-        # 태그 기반 관련성 점수로 정렬 → 가장 관련성 높은 영상 선택
-        scored = sorted(videos, key=lambda v: _score_video(v, query), reverse=True)
-        print(f"  [Pexels video] '{query}' {len(scored)}개 결과, 최고점수 {_score_video(scored[0], query)}점")
+        # 주인공 필터: subject가 URL slug 또는 태그에 없으면 제외
+        relevant = [v for v in videos if _is_subject_present(v, subject)]
+        if not relevant:
+            print(f"  [Pexels video] '{query}': '{subject}' 포함 영상 없음, 다음 키워드...")
+            time.sleep(0.2)
+            continue
+
+        # 점수 정렬 + 이미 사용된 영상 ID 제외
+        scored = sorted(relevant, key=lambda v: _score_video(v, query), reverse=True)
+        print(f"  [Pexels video] '{query}' 관련 {len(relevant)}개, 최고점수 {_score_video(scored[0], query)}점")
 
         for video in scored:
+            if video["id"] in used_ids:
+                continue
             vf = _best_hd_file(video)
             if vf:
                 out = ASSETS_DIR / f"{scene_id}_{query.replace(' ', '_')[:20]}.mp4"
                 if _download(vf["link"], out):
+                    used_ids.add(video["id"])
                     return out
-
         time.sleep(0.2)
+
+    # 마지막 수단: 주인공 필터 없이 primary 키워드로 재시도 (영상 확보 보장)
+    print(f"  [Pexels video] 모든 키워드 실패 → 필터 해제 후 '{keyword}' 재시도")
+    params = {"query": keyword, "orientation": "landscape", "size": "large", "per_page": 5}
+    try:
+        resp = requests.get(PEXELS_VIDEO_URL, headers={"Authorization": PEXELS_API_KEY}, params=params, timeout=15)
+        resp.raise_for_status()
+        for video in resp.json().get("videos", []):
+            if video["id"] in used_ids:
+                continue
+            vf = _best_hd_file(video)
+            if vf:
+                out = ASSETS_DIR / f"{scene_id}_{keyword.replace(' ', '_')[:20]}.mp4"
+                if _download(vf["link"], out):
+                    used_ids.add(video["id"])
+                    return out
+    except Exception as e:
+        print(f"  [Pexels video] 최종 재시도 실패: {e}")
 
     return None
 
