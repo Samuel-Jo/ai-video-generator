@@ -76,16 +76,38 @@ FEW_SHOT = """\
 """
 
 
-def generate_script(topic: str, duration_sec: int = 180) -> dict:
+def generate_script(topic: str, duration_sec: int = 180,
+                    available_footage: dict = None) -> dict:
+    """
+    available_footage: {"wolf": True, "snow_leopard": False, ...}
+    footage_scout.scout_topic() 의 반환값을 전달하면
+    Gemini가 영상 없는 동물을 대본에서 제외함.
+    """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
 
     client = genai.Client(api_key=GEMINI_API_KEY)
 
+    # 영상 가용성 안내 프롬프트 생성
+    footage_note = ""
+    if available_footage:
+        available   = [k for k, v in available_footage.items() if v]
+        unavailable = [k for k, v in available_footage.items() if not v]
+        if available:
+            footage_note += f"\n[영상 재고 확인 결과]\n"
+            footage_note += f"- 영상 있음 (사용 가능): {', '.join(available)}\n"
+        if unavailable:
+            footage_note += (
+                f"- 영상 없음 (사용 금지): {', '.join(unavailable)}\n"
+                f"  → 위 동물은 scenes에 포함하지 말고, "
+                f"서식지/환경 묘사나 다른 가능 동물로 대체할 것.\n"
+            )
+
     prompt = (
         f"{FEW_SHOT}\n\n"
         f"주제: \"{topic}\"\n"
-        f"목표 시간: {duration_sec}초\n\n"
+        f"목표 시간: {duration_sec}초\n"
+        f"{footage_note}\n"
         "위 주제로 JSON 대본을 작성해주세요."
     )
 

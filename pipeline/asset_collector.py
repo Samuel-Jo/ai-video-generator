@@ -26,6 +26,7 @@ from config import (
 PEXELS_VIDEO_URL  = "https://api.pexels.com/videos/search"
 PEXELS_PHOTO_URL  = "https://api.pexels.com/v1/search"
 PIXABAY_VIDEO_URL = "https://pixabay.com/api/videos/"
+WIKIMEDIA_API     = "https://commons.wikimedia.org/w/api.php"
 UNSPLASH_URL      = "https://api.unsplash.com/search/photos"
 
 # ──────────────────────────────────────────────────────────────────
@@ -89,8 +90,12 @@ _gemini_client = None
 def _get_gemini():
     global _gemini_client
     if _gemini_client is None and GEMINI_API_KEY:
-        from google import genai as _g
-        _gemini_client = _g.Client(api_key=GEMINI_API_KEY)
+        try:
+            from google import genai as _g
+            _gemini_client = _g.Client(api_key=GEMINI_API_KEY)
+            print("[Gemini Vision] 초기화 성공 ✅")
+        except Exception as e:
+            print(f"[Gemini Vision] 초기화 실패 — 검증 비활성화: {e}")
     return _gemini_client
 
 
@@ -165,7 +170,10 @@ def _verify_thumbnail(thumbnail_url: str, subject: str) -> bool:
     slug/태그로 잡지 못한 미묘한 불일치(늑대→개 등) 차단.
     """
     client = _get_gemini()
-    if client is None or not thumbnail_url:
+    if client is None:
+        print(f"  [Gemini Vision] ⚠️ 비활성화 — '{subject}' 검증 생략")
+        return True
+    if not thumbnail_url:
         return True
     try:
         from google.genai import types
@@ -192,7 +200,7 @@ def _verify_thumbnail(thumbnail_url: str, subject: str) -> bool:
 
 
 def _best_hd_file(video: dict) -> dict | None:
-    """width >= 1280 인 파일 중 해상도 최고 반환."""
+    """최고 해상도 파일 반환. HD(≥1280) 우선, 없으면 ≥640 허용 (Wikimedia 등)."""
     files = sorted(
         video.get("video_files", []),
         key=lambda f: (f.get("width", 0), f.get("height", 0)),
@@ -200,6 +208,10 @@ def _best_hd_file(video: dict) -> dict | None:
     )
     for vf in files:
         if vf.get("width", 0) >= 1280:
+            return vf
+    # HD 없으면 640p 이상 허용 (Wikimedia 다큐 영상 등)
+    for vf in files:
+        if vf.get("width", 0) >= 640:
             return vf
     return None
 
@@ -249,6 +261,66 @@ def _pixabay_search(query: str, per_page: int = 15) -> list:
     except Exception as e:
         print(f"  [Pixabay] '{query}' 오류: {e}")
         return []
+
+
+def _wikimedia_search(query: str, max_results: int = 8) -> list:
+    """
+    Wikimedia Commons에서 실제 야생동물 영상 검색.
+    API 키 불필요, CC 라이선스, 실제 다큐 영상 보유.
+    """
+    try:
+        # generator=search 로 파일 목록 + videoinfo 한 번에 조회
+        resp = requests.get(
+            WIKIMEDIA_API,
+            params={
+                "action":    "query",
+                "generator": "search",
+                "gsrsearch": f"{query} filetype:video",
+                "gsrnamespace": "6",
+                "gsrlimit":  str(max_results),
+                "prop":      "videoinfo",
+                "viprop":    "url|dimensions|mime|thumburl",
+                "viurlwidth": "1280",
+                "format":    "json",
+            },
+            timeout=12,
+        )
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+    except Exception as e:
+        print(f"  [Wikimedia] '{query}' 오류: {e}")
+        return []
+
+    results = []
+    for page in pages.values():
+        title = page.get("title", "")
+        vi    = (page.get("videoinfo") or [{}])[0]
+        url   = vi.get("url", "")
+        mime  = vi.get("mime", "")
+        w     = vi.get("width", 0)
+        h     = vi.get("height", 0)
+
+        # 동영상 파일만 (ogg/webm/mp4), 너무 작은 건 제외
+        if not url or "video" not in mime or w < 320:
+            continue
+
+        # 파일명에서 태그 추출 (File:Wolf_running_snow.webm → [wolf, running, snow])
+        name_tags = re.sub(r'\.(webm|ogv|ogg|mp4)$', '', title, flags=re.I)
+        name_tags = re.sub(r'^File:', '', name_tags)
+        tags = [{"title": t.strip().lower()} for t in
+                re.split(r'[_\-\s]+', name_tags) if t.strip()]
+
+        results.append({
+            "id":          f"wiki_{page['pageid']}",
+            "url":         f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}",
+            "image":       vi.get("thumburl", ""),
+            "tags":        tags,
+            "video_files": [{"link": url, "width": w, "height": h}],
+        })
+
+    if results:
+        print(f"  [Wikimedia] '{query}' {len(results)}개 야생동물 영상 발견")
+    return results
 
 
 def _pixabay_to_internal(hit: dict) -> dict:
@@ -410,21 +482,43 @@ def _fetch_video(
     else:
         print(f"  [Pixabay] API 키 없음 (pixabay.com/api/ 에서 무료 발급 권장)")
 
-    # ── 3단계: 서식지 폴백 (사람 등장 방지) ─────────────────────
+    # ── 2.5단계: Wikimedia Commons (실제 야생동물 다큐 영상) ────
+    for query in queries:
+        q_subject  = _extract_subject(query)
+        candidates = _wikimedia_search(query)
+        if not candidates:
+            continue
+
+        print(f"  [Wikimedia] '{query}' {len(candidates)}개, 주인공: '{q_subject}'")
+        best = _select_best(candidates, query, q_subject, used_ids, use_gemini)
+        if best:
+            out = _download_video(best, scene_id, query, used_ids)
+            if out:
+                return out
+        time.sleep(0.5)
+
+    # ── 3단계: 서식지 폴백 — _select_best() 거쳐 최적 선택 ─────
     habitat_query = (
         habitat_hint.strip()
         or _get_habitat_fallback(keyword, subject)
     )
     print(f"  ⚠️ 동물 영상 없음 → 서식지 대체: '{habitat_query}'")
 
-    for source in ("pexels", "pixabay"):
+    for source in ("pexels", "pixabay", "wikimedia"):
         if source == "pixabay" and not PIXABAY_API_KEY:
             continue
-        candidates = _gather_candidates(habitat_query, source)
-        for v in candidates:
-            if v["id"] in used_ids:
-                continue
-            out = _download_video(v, scene_id, habitat_query, used_ids)
+        candidates = (
+            _wikimedia_search(habitat_query)
+            if source == "wikimedia"
+            else _gather_candidates(habitat_query, source)
+        )
+        if not candidates:
+            continue
+        # 서식지 장면은 동물 주인공 필터 불필요, Gemini 검증도 생략
+        best = _select_best(candidates, habitat_query,
+                            habitat_query.split()[0], used_ids, use_gemini=False)
+        if best:
+            out = _download_video(best, scene_id, habitat_query, used_ids)
             if out:
                 return out
         time.sleep(0.3)

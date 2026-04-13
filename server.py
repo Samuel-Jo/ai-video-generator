@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from pipeline.script_gen import generate_script, save_script
+from pipeline.footage_scout import scout_topic
 from pipeline.asset_collector import collect_assets
 from pipeline.ffmpeg_renderer import render as ffmpeg_render
 from pipeline.tts_gen import generate_all as tts_generate_all
@@ -119,9 +120,13 @@ def _update(job_id: str, status: Status, progress: int, message: str):
 
 def _run_pipeline(job_id: str, topic: str, duration: int):
     try:
-        # Phase 1: 대본 생성
-        _update(job_id, Status.RUNNING, 5, "대본 생성 중...")
-        script = generate_script(topic, duration)
+        # Phase 0: 영상 재고 스카우트 (어떤 동물이 실제로 존재하는지 확인)
+        _update(job_id, Status.RUNNING, 3, "영상 재고 확인 중...")
+        available_footage = scout_topic(topic)
+
+        # Phase 1: 대본 생성 (가용 동물 목록 전달)
+        _update(job_id, Status.RUNNING, 8, "대본 생성 중...")
+        script = generate_script(topic, duration, available_footage=available_footage)
         save_script(script, topic)
         _update(job_id, Status.RUNNING, 25, f"대본 완료: {script['title']}")
 
