@@ -30,7 +30,8 @@ SYSTEM_PROMPT = """\
       "scene_id": 1,
       "narration": "나레이션 텍스트 (자연스러운 한국어)",
       "duration_sec": 20,
-      "visual_description": "영문 Pexels 검색 키워드 (3단어 이내, 예: technology future AI)",
+      "visual_description": "영문 Pexels 검색 키워드 (주인공 이름 첫 단어 필수, 예: wolf running snow)",
+      "search_fallbacks": ["wolf pack forest", "wolf wildlife"],
       "subtitle": "화면 하단에 표시할 자막 (30자 이내 핵심 문장)"
     }
   ]
@@ -38,7 +39,12 @@ SYSTEM_PROMPT = """\
 
 규칙:
 - scenes 배열의 duration_sec 합계 = duration_sec (오차 +-10초 허용)
-- visual_description은 반드시 영문, Pexels에서 검색 가능한 구체적 키워드
+- visual_description: 반드시 영문, 나레이션의 주인공(동물·사물·인물)을 첫 단어로 포함
+  예) 늑대 장면 → "wolf running snow" (wolf 첫 단어, dog/canine 사용 금지)
+  예) 여우 장면 → "fox snow forest" (fox 첫 단어)
+  예) 전기차 장면 → "electric car highway" (electric car 우선)
+- search_fallbacks: 검색 실패 시 사용할 대체 키워드 2개 (구체적→일반적 순서)
+  예) ["wolf pack howling", "wolf animal wilderness"]
 - 장면은 8~12개 사이로 구성
 - narration은 각 장면당 읽는 데 duration_sec 초가 걸리는 분량
 """
@@ -55,7 +61,8 @@ FEW_SHOT = """\
       "scene_id": 1,
       "narration": "2026년, 전기차는 더 이상 미래의 이야기가 아닙니다. 전 세계 자동차 판매량의 30%를 넘어선 전기차 시장의 현재를 살펴봅니다.",
       "duration_sec": 20,
-      "visual_description": "electric car future highway",
+      "visual_description": "electric car highway future",
+      "search_fallbacks": ["electric vehicle charging", "electric car road"],
       "subtitle": "전기차 점유율 30% 돌파"
     }
   ]
